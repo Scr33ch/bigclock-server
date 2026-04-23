@@ -6,9 +6,8 @@
 - allow gui to send/update message or error
 - make view cache button work
 - provide client options edit dialog
-- persistent configuration (registry or dotfile)
 - make server-provided options survive a reload
 - ability to show schedule data on bigtod
-- timed race last-lap prediction
+- improve timed race last-lap prediction
 - major refactoring and cleanup
 - documentation
