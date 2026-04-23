@@ -6,10 +6,14 @@
 body   { background: #ffffff; }
 table { width: 100%; }
 
+.invisible { visibility: hidden !important; }
+.hidden { display: none !important; }
+
+
 div.top {
   margin-left: auto;
   margin-right: auto;
-  --bigclock-version: "1.2-@@@@@@-@@@@@@"
+  --bigclock-version: "1.3-Screech-@@@@@@-@@@@@@"
 }
 div.chromeHD { /* For chromecast on a 16:9 screen */
   width: 95%;
@@ -34,7 +38,7 @@ div.version {
   color: #ff00ff;
 }
 div#logo { top: 0; left: 0; position: absolute; }
-div#logo img { width: 175px; height: 125px; }
+div#logo img { width: 125px; height: 125px; }
 div#version { top: 0; left:  0; }
 div#options { top: 0; right: 0; }
 div.chrome43 div#logo    { top: 15px; left:  85px; }
@@ -45,8 +49,10 @@ div.chromeTV div#options { top: 30px; right: 185px; }
 
 /* raceinfo aka big-race-clock */
 tr.header      th { font-size: 48pt; font-weight: bold; }
+
 table.bigclock th { font-size: 30pt;  font-weight: normal; text-align: center; }
 table.bigclock td { font-size: 120pt; font-weight: bold; text-align: center; }
+tr.totals      td { font-size: 70pt; font-weight: bold; }
 table.footer   th { font-size: 24pt;  font-weight: normal; }
 
 col.laps     { width: 40%; }
@@ -72,15 +78,30 @@ div.RedFlag       { background: #ff0000; color: #ffffff; }
 div.CheckeredFlag { background: #000000; color: #ffffff;
   text-decoration: blink;
   -webkit-animation-name: blinker;
+  animation-name: blinker;
   -webkit-animation-duration: 0.6s;
+  animation-duration: 0.6s;
   -webkit-animation-iteration-count: infinite;
+  animation-iteration-count: infinite;
   -webkit-animation-timing-function: ease-in-out;
+  animation-timing-function: ease-in-out;
   -webkit-animation-direction: alternate;
+  animation-direction: alternate;
 }
 
 @-webkit-keyframes blinker {
   from {opacity: 1.0;}
   to {opacity: 0.0;}
+}
+
+@keyframes blinker {
+  from {opacity: 1.0;}
+  to {opacity: 0.0;}
+}
+@keyframes slow-blink {
+    0%   { opacity: 1; }
+    50%  { opacity: 0.1; }
+    100% { opacity: 1; }
 }
 
 /* bigtod time-of-day clock */
@@ -89,8 +110,35 @@ table.bigtod td { font-size: 220pt; font-weight: bold; text-align: center; }
 div.chrome43 table.bigtod td { font-size: 200pt; }
 div.chromeTV table.bigtod td { font-size: 200pt; }
 table.bigtod { position: relative; top: 100px; }
+.timing-only, .race-only { display: none; }
+tr.timing-only { display: none; }
+tr.divider { height: 5px;fill: lightskyblue; background-color: lightskyblue; column-span: all;}
+span.stopped-indicator {
+  display: none;
+  font-size: 24pt; 
+  color: darksalmon;
+  text-transform: uppercase;
+  animation: slow-blink 2s infinite ease-in-out;
+}
+.branding-logo {visibility: hidden;}
+.close-fin {color:red; font-size:30pt; font-weight:normal; position:absolute; width:100%; text-align:center; line-height:1; display: none;}
+.close-fin-before { top: 5px; }
+.close-fin-after { bottom: 5px; }
 
 /* global status display */
 div.status   { font-size: 24pt; font-weight: normal; text-align: center; }
 span#message { color: #0000ff; display: none; }
 span#error   { color: #ff0000; }
+
+[data-mode="timing"][data-session="race"] span.timing-only.race-only { display: inline;}
+[data-mode="timing"][data-session="race"][data-closefinish="before"]:not([data-status="stopped"]):not([data-flag="Checkered"]) div.close-fin-before { 
+  display: block;
+}
+[data-mode="timing"][data-session="race"][data-closefinish="after"]:not([data-status="stopped"]):not([data-flag="Checkered"]) div.close-fin-after { 
+  display: block;
+}
+[data-session="qual"] .progress {visibility: hidden;}
+[data-mode="timing"] tr.timing-only { display:table-row; visibility: visible;}
+[data-status="stopped"] .stopped-indicator { display: block; }
+[data-nologo="false"] .branding-logo { visibility: visible; }
+[data-showversion="true"] .version { visibility: visible; }
