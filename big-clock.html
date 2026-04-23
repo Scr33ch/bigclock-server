@@ -5,20 +5,18 @@
  * All Rights Reserved.
  * See LICENSE for licensing terms.
 -->
-<html><head>
-<title>Big Race Clock</title>
-<link rel="stylesheet" href="big-clock.css" type="text/css" />
-<!--
-<link rel="shortcut.icon" href="big-clock.ico" />
--->
-<script src="big-clock.js" type="text/javascript" defer="1"></script>
-<meta http-equiv="Content-Script-Type" content="text/javascript">
+<html lang="en-US">
+<head>
+    <title>Big Race Clock</title>
+    <link rel="stylesheet" href="big-clock.css" type="text/css" />
+    <script src="big-clock.js" type="text/javascript" defer="1"></script> 
+    <meta http-equiv="Content-Script-Type" content="text/javascript">
 </head>
 <body onload="onLoad()" onhashchange="process_opts()">
 <div class="top" id="topdiv">
-  <div id="logo"><img src="logo.jpg"></div>
+  <div class="branding-logo"><img src="logo.png"><span class="timing-only race-only" style="vertical-align: top;"><input type="checkbox" id="wf_alert" value="1">Play white flag alert</input></span></div>
   <div class="version" id="version">BigClock <span id="version_srv">???</span>
-    / HTML <span id="version_html">1.2-@@@@@@-@@@@@@</span>
+    / HTML <span id="version_html">1.3-Screech-@@@@@@-@@@@@@</span>
     / CSS  <span id="version_css">???</span>
     / JS   <span id="version_js">???</span>
   </div>
@@ -27,16 +25,39 @@
     <div id="flag"><span id="flagtext"></span></div>
     <table class="raceinfo">
       <tr class="header">
-        <th id="run" colspan=2></th>
+        <th colspan=2><span id="run"></span><span class="stopped-indicator"> SESSION INACTVE</span></th>
       </tr>
-      <tr class="bigclock"><td><table class="bigclock">
+      <tr class="bigclock">
+        <td>
+          <table class="bigclock">
             <col class="laps"><col class="time">
             <tr><td id="laps">--</td><td id="elapsed">--:--:--</td></tr>
-            <tr><th>Laps</th><th>Time Elapsed</th></tr>
-            <tr><td id="laps2go">----</td><td id="timeleft">--:--:--</td></tr>
-            <tr><th>Laps to Go</th><th>Time Remaining</th></tr>
-      </table></td></tr>
-      <tr class="footer"><td><table class="footer">
+            <tr><th>Laps Completed</th><th>Elapsed Tm</th></tr>
+            <tr class="divider"></tr>
+            <tr>
+              <td id="laps2go">----</td>
+              <td style="position:relative;">
+                <div class="close-fin close-fin-before" id="projected_above"></div>
+                <span id="timeleft">--:--:--</span>
+                <div class="close-fin close-fin-after" id="projected_below"></div>
+              </td>
+            </tr>
+            <tr><th>Laps Remaining</th><th>Scheduled Remaining Tm</th></tr>
+            <tr class="divider"></tr>
+            <tr class="timing-only totals">
+              <td><span class="timing-only race-only"><span id="proj_total_laps">--</span> / </span><span id="sched_total_laps">--</span></td>
+              <td><span class="timing-only race-only"><span id="proj_total">--:--:--</span> / </span><span id="sched_total">--:--</span></td>
+            </tr>
+            <tr class="timing-only">
+              <th><span class="timing-only race-only">Projected / </span>Scheduled Total Laps</th>
+              <th><span class="timing-only race-only">Projected / </span>Scheduled Total Tm (mm:ss)</th>
+            </tr>
+          </table>
+        </td>
+      </tr>
+      <tr class="footer">
+        <td>
+          <table class="footer">
             <col class="leaders"><col class="progress"><col class="tod">
             <tr>
               <th class="leaders">Leaders: <span id="leaders"></span></th>
@@ -48,7 +69,9 @@
             <tr>
               <th class="leaders" colspan=3><span id="clslead"></span></th>
             </tr>
-      </table></td></tr>
+          </table>
+        </td>
+      </tr>
     </table>
   </div>
   <div id="bigtod">
