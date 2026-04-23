@@ -4,6 +4,7 @@
  * See LICENSE for licensing terms.
  */
 var f_topdiv   = document.getElementById("topdiv");
+var f_wfAlert  = document.getElementById("wf_alert");
 var f_run      = document.getElementById("run");
 var f_tod      = document.getElementById("tod");
 var f_tod2     = document.getElementById("tod2");
@@ -12,8 +13,11 @@ var f_flag     = document.getElementById("flag");
 var f_flagtext = document.getElementById("flagtext");
 var f_laps     = document.getElementById("laps");
 var f_laps2go  = document.getElementById("laps2go");
+var f_projLaps = document.getElementById("proj_total_laps");
+var f_totlaps = document.getElementById("sched_total_laps");
 var f_elapsed  = document.getElementById("elapsed");
 var f_timeleft = document.getElementById("timeleft");
+var f_sched_total = document.getElementById("sched_total");
 var f_leaders  = document.getElementById("leaders");
 var f_clslead  = document.getElementById("clslead");
 var f_progress = document.getElementById("progress");
@@ -29,6 +33,8 @@ var f_v_js     = document.getElementById("version_js");
 var f_v_srv    = document.getElementById("version_srv");
 var f_v_opts   = document.getElementById("version_opts");
 
+var f_proj_elements = document.getElementsByClassName("projection-span");
+
 var css_version = "";
 var js_version = "1.3-@@@@@@-@@@@@@";
 var data_port = "9999";
@@ -41,7 +47,7 @@ var maxLeaders = 3;
 var cars = new Object;
 var classes = new Object;
 var car_class = new Object;
-var is_qual = false;
+var is_qual = undefined;
 var Gclass_lead = new Object;
 var Gclass_lead_text = "";
 var Gleaders = [];
@@ -52,10 +58,41 @@ var Hleaders_text = "";
 var last_passing = new Object;
 var progress_start = undefined;
 var progress_length = undefined;
+var planned_laps2go = undefined;
+var estimated_laps2go = undefined;
 var tod_is_local = false;
 var opts_changed = false;
 var hb_timeout;
 var server_error = "";
+var white_flag_warned = false;
+console.log(`white_flag_warned initialized as ${white_flag_warned}`);
+var cached_scheduled_total = undefined; // Performance cache for race duration
+var last_messages = new Object(); // Stores the last raw string for each message type
+
+// Move formatting to a shared helper
+function fmt_time(t, includeMS) {
+    var h = Math.floor(t / 3600);
+    var m = Math.floor((t % 3600) / 60);
+    var s = t % 60;
+    
+    // If includeMS is false, we round the seconds to the nearest integer
+    var s_str = includeMS ? s.toFixed(3) : Math.round(s).toString();
+    
+    // Ensure leading zeros for seconds
+    if (includeMS) {
+        if (s < 10) s_str = "0" + s_str;
+    } else {
+        if (s < 10) s_str = "0" + s_str;
+    }
+    
+    var m_str = (m < 10) ? "0" + m : m;
+    if (h > 0) return h + ":" + m_str + ":" + s_str;
+    return m_str + ":" + s_str;
+}
+
+function isNumeric(val){
+  return !isNaN(parseFloat(val)) && isFinite(val);
+}
 
 function getCookie(name) {
     function escape(s) { return s.replace(/([.*+?\^${}()|\[\]\/\\])/g, '\\$1'); };
@@ -80,21 +117,30 @@ function process_opts(optstr) {
     }
   });
 
-  if (opts.has("mode")) display_mode = opts.get("mode");
+  if (opts.has("mode")) display_mode = opts.get("mode").toLowerCase().trim();
   else display_mode = "raceinfo";
+  
+  f_topdiv.dataset.mode = display_mode;
+
+  // Alias "timing" to use the raceinfo UI layout
+  var show_mode = (display_mode === "timing") ? "raceinfo" : display_mode;
+
   for (var mode of display_modes) {
     var e = document.getElementById(mode);
-    if (display_mode == mode) e.style.display = "block";
-    else                      e.style.display = "none";
+    if (show_mode == mode) e.style.display = "block";
+    else                   e.style.display = "none";
   }
-
+  
+  if (opts.has("tz")) {
+    timezone = opts.get("tz");
+  }
   if (opts.has("tz")) {
     timezone = opts.get("tz");
     if (tod_is_local) show_local_time();
   }
 
   f_topdiv.className = "top";
-  if (opts.has("display")) {
+  if (opts.has("display")) { // [none], chromeHD, chromeTV, chrome43
     f_topdiv.classList.add(opts.get("display"));
   }
 
@@ -102,19 +148,19 @@ function process_opts(optstr) {
     f_topdiv.style.zoom = opts.get("zoom");
   }
 
-  if (opts.has("logo")) {
-    f_logo.style.visibility = "visible";
+  if (opts.has("nologo")) {
+    f_topdiv.dataset.nologo = true;
   } else {
-    f_logo.style.visibility = "hidden";
+    f_topdiv.dataset.nologo = false;
   }
 
   if (opts.has("version")) {
-    f_version.style.visibility = "visible";
-    f_options.style.visibility = "visible";
-  } else {
-    f_version.style.visibility = "hidden";
-    f_options.style.visibility = "hidden";
+    f_topdiv.dataset.showversion = true;
   }
+  
+  // Ensure changes reflect immediately
+  updateLaps2Go();
+  if (typeof updateProjectedTime === "function") updateProjectedTime();
 }
 
 function show_local_time () {
@@ -158,6 +204,7 @@ function setFlag(flag) {
   } else {
     f_flag.className = flag + "Flag";
     f_flagtext.textContent = flag + " Flag";
+    f_topdiv.dataset.flag = flag;
   }
 }
 
@@ -182,6 +229,86 @@ function updateProgress(elapsed) {
   /* showMessage(msg); */
 }
 
+function updateLaps2Go() {
+  if (planned_laps2go == 9999 || planned_laps2go === undefined) {
+    f_laps2go.textContent = '';
+    f_laps2go.style.color = '';
+    return;
+  }
+
+  // ONLY show estimated vs scheduled when in timing mode
+  if (display_mode === 'timing' && estimated_laps2go !== undefined && estimated_laps2go < planned_laps2go) {
+    f_laps2go.textContent = estimated_laps2go + '/' + planned_laps2go;
+    f_laps2go.style.color = 'orange';
+    return;
+  }
+
+  // Standard display for raceinfo mode
+  f_laps2go.textContent = planned_laps2go;
+  f_laps2go.style.color = '';
+}
+
+function updateProjectedTime() {
+  var f_proj_above = document.getElementById("projected_above");
+  var f_proj_below = document.getElementById("projected_below");
+  var f_proj_total = document.getElementById("proj_total");
+
+  if (!f_proj_above || !f_proj_below || cached_scheduled_total === undefined) return;
+
+  // Exit if data is missing or not in timing mode
+  if (display_mode !== 'timing' || progress_length === undefined || progress_length <= 0 || progress_start === undefined) {
+    delete f_topdiv.dataset.closefinish;
+    if (f_proj_total) f_proj_total.textContent = "--:--:--";
+    return;
+  }
+
+  // 1. Calculate Laps Remaining based strictly on the TIME LIMIT
+  var time_to_limit = cached_scheduled_total - progress_start;
+  var laps_by_time = Math.ceil(time_to_limit / progress_length);
+
+  // 2. Get Laps Remaining based strictly on the LAP LIMIT (from $F)
+  var laps_by_count = parseInt(planned_laps2go);
+  // If Orbits sends 0 or 9999 for a timed race, we ignore the lap cap
+  if (isNaN(laps_by_count) || laps_by_count <= 0 || laps_by_count > 500) {
+      laps_by_count = 9999; 
+  }
+
+  // 3. THE CAP: True laps to go is the shorter of the two
+  var true_laps_to_go = Math.min(laps_by_time, laps_by_count);
+  if (isNumeric(f_laps.textContent)) {
+
+    var projected_total_laps = parseInt(f_laps.textContent) + true_laps_to_go;
+    console.log(`Completed laps (${parseInt(f_laps.textContent)}) + true_laps_to_go (${true_laps_to_go}) = ${projected_total_laps}`)
+    if (f_projLaps.textContent != projected_total_laps.toString())
+      f_projLaps.textContent = projected_total_laps.toString();
+  }
+
+  // 4. Calculate Projected Finish Time based on the CAP
+  var time_after = progress_start + (true_laps_to_go * progress_length);
+  var delta_after = time_after - cached_scheduled_total;
+
+  // 5. Projected White Flag crossing (one lap before finish)
+  var time_before = time_after - progress_length;
+  var delta_before = time_before - cached_scheduled_total;
+
+  // Update UI (Projected Total includes MS)
+  if (f_proj_total) f_proj_total.textContent = fmt_time(time_after, true);
+
+  // Radar Display (Offsets only)
+  if (Math.abs(delta_before) <= 30 && delta_before !== 0) {
+    f_proj_above.textContent = "(" + (delta_before > 0 ? "+" : "") + delta_before.toFixed(3) + " sec)";
+    f_topdiv.dataset.closefinish = "before";
+  } else if (Math.abs(delta_after) <= 30 && delta_after !== 0) {
+    f_proj_below.textContent = "(" + (delta_after > 0 ? "+" : "") + delta_after.toFixed(3) + " sec)";
+    f_topdiv.dataset.closefinish = "after";
+  } else {
+    delete f_topdiv.dataset.closefinish;
+  }
+  
+  // Return the calculated laps to go so the calling function can use it for audio
+  return true_laps_to_go;
+}
+
 function computePassing(passing) {
   progress_start = undefined;
   progress_length = undefined;
@@ -191,9 +318,30 @@ function computePassing(passing) {
     if (length > 0) {
       progress_start = parse_time(passing.elapsed);
       progress_length = length;
+      
+      if (f_timeleft.textContent != '') {
+        var timeleft_ms = parse_time(f_timeleft.textContent);
+        if (timeleft_ms !== undefined && timeleft_ms >= 0) {
+          estimated_laps2go = Math.ceil(timeleft_ms / progress_length);
+        }
+      }
     }
   }
   updateProgress(f_elapsed.textContent);
+  updateLaps2Go();
+  
+  // Run the projection and capture the resulting lap count
+  var lapsLeft = updateProjectedTime();
+
+  // AUDIO ALERT TRIGGER: Only runs when this function is called (on passing)
+  // If lapsLeft is 2, the leader just crossed and has 2 projected laps left.
+  if (lapsLeft === 2 && !white_flag_warned) {
+    white_flag_warned = true;
+    if (f_wfAlert && f_wfAlert.checked) {
+      var activeUtterance = new SpeechSynthesisUtterance("Confirm White Flag call around.");
+      window.speechSynthesis.speak(activeUtterance);
+    }
+  }
 }
 
 function showError(msg) {
@@ -223,8 +371,17 @@ function heartbeat(e,s) {
 function doconnect() {
     try {
         var host = "ws://" + window.location.hostname + ":" + data_port + "/";
+        if (window.location.protocol === "https:") {
+            // Useful with using a reverse proxy host that handles all of the SSL offloading and can redirect to the propery port over ws: on the internal lan  
+            var host = "wss://" + window.location.hostname + "/bigclock-ws/";
+        } 
         console.log("Host:", host);
-        var s = new WebSocket(host);
+        try {
+          var s = new WebSocket(host);
+        } catch (errror) {
+          console.error(`failed to open connection to ${host}: ${errror}`);
+        }
+        if (!s) return;
         s.onopen = function (e) {
             console.log("Socket opened.");
             heartbeat(e,s);
@@ -240,7 +397,7 @@ function doconnect() {
         };
         s.onmessage = function (e) {
             heartbeat(e,s);
-            console.log("Socket message:", e.data);
+            //console.log("Socket message:", e.data);
             if (opts_changed) {
               s.send(JSON.stringify(['%O', f_v_opts.textContent]));
               opts_changed = false;
@@ -250,6 +407,9 @@ function doconnect() {
               return;
             }
             var fields = JSON.parse(e.data);
+            if (last_messages[fields[0]] === e.data)
+              return;
+            last_messages[fields[0]] = e.data;
             //f_run.textContent = fields[0];
             /* Possible field formats:
              *   $A,regno,car,txno,first,last,nat,classno
@@ -262,6 +422,8 @@ function doconnect() {
              *   $H,pos,regno,bestlap,besttime
              *   $I,tod,date (init/reset)
              *   $J,regno,laptime,time
+             *   $SP,pos,regno,sectorIdx,sectorTm,elapsedMs
+             *   $SR,pos,regno,sectorIdx,recordTm,elapsedMs
              *
              *   :V,server-version
              */
@@ -271,45 +433,91 @@ function doconnect() {
 
             } else if (fields[0] == '$B') {
               /* Run info: $B,id,description */
+              if (f_run.textContent !== fields[2]) {
+                white_flag_warned = false; 
+                console.log(`white_flag_warned set to ${white_flag_warned}`);
+                cached_scheduled_total = undefined;
+              }
               f_run.textContent = fields[2];
               var run_is_qual = (
                                  fields[2].match(/qual|prac|test/i)
                                  && !fields[2].match(/race/i))
-              if (!is_qual && run_is_qual) {
+              console.log(`is_qual = ${is_qual} / run_is_qual = ${run_is_qual} / f_topdiv.dataset.session = ${f_topdiv.dataset.session}`);
+              if (f_topdiv.dataset.session == undefined)
+                f_topdiv.dataset.session = "race";
+              if ((is_qual == undefined || !is_qual) && run_is_qual) {
+                console.log('Switching to qual mode');
                 is_qual = true;
                 f_leaders.textContent = Hleaders_text;
                 f_clslead.textContent = Hclass_lead_text;
-              } else if (is_qual && !run_is_qual) {
+                f_topdiv.dataset.session = "qual";
+              } else if ((is_qual == undefined || is_qual) && !run_is_qual) {
+                console.log('Switching to race mode');
                 is_qual = false;
                 f_leaders.textContent = Gleaders_text;
                 f_clslead.textContent = Gclass_lead_text;
+                f_topdiv.dataset.session = "race";
               }
-
+              if (fields[1] == "95" && f_topdiv.dataset.status != "stopped") {
+                f_topdiv.dataset.status = "stopped";
+                delete f_topdiv.dataset.closefinish;
+              } else if (fields[1] != "95" && f_topdiv.dataset.status != "running") {
+                f_topdiv.dataset.status = "running";
+              }
             } else if (fields[0] == '$C') {
               /* Class: $C,classno,description */
               classes[fields[1]] = fields[2];
 
             } else if (fields[0] == '$F') {
               /* flag info: $F,laps2go,remaining,tod,elapsed,flag */
-              if (fields[1] == 9999) f_laps2go.textContent = '';
-              else                   f_laps2go.textContent = fields[1];
+              planned_laps2go = fields[1];
               f_timeleft .textContent = fields[2];
               f_tod      .textContent = fields[3];
               f_tod2     .textContent = fields[3];
               f_elapsed  .textContent = fields[4];
+              if (cached_scheduled_total === undefined && fields[2] !== "00:00:00") {
+                var t_left = parse_time(fields[2]);
+                var t_elap = parse_time(fields[4]);
+                if (t_left !== undefined && t_elap !== undefined) {
+                    var total = t_elap + t_left;
+                    // Smooth the +/- 1s jitter
+                    var rem = Math.round(total) % 60;
+                    if (rem === 59) total += 1;
+                    else if (rem === 1) total -= 1;
+                    
+                    cached_scheduled_total = total;
+                    
+                    if (f_sched_total) f_sched_total.textContent = fmt_time(total, false);
+                    var totLaps = undefined;
+                    if (isNumeric(planned_laps2go)){
+                      if (isNumeric(f_laps.textContent)) {
+                        totLaps = parseInt(planned_laps2go) + parseInt(f_laps.textContent);
+                      } else {
+                        totLaps = parseInt(planned_laps2go) ;
+                      }
+                    }
+                    if (totLaps > 9999) totLaps = 9999;
+                    if (f_totlaps) {
+                      f_totlaps.textContent = totLaps.toString();
+                      f_totlaps.style.visibility = totLaps == 9999 ? 'hidden' : 'visible';
+                    }
+                }
+              }
               tod_is_local = false;
               setFlag(fields[5]);
               updateProgress(fields[4]);
-
+              updateLaps2Go();
+              updateProjectedTime();
             } else if (fields[0] == '$G') {
               var leaderstr;
               /* race info: $G,pos,regcode,laps,time */
               if (fields[1] == 1) {
                 f_laps.textContent = fields[3];
+                if (f_laps.textContent == "") f_laps.textContent = "0";
                 computePassing(last_passing[fields[2]])
               }
               /* ignore cars with 0 time, except overall leader */
-              if (fields[1] > 1 && fields[4] == "00:00:00.000") {
+              if (fields[1] > 1 && (fields[4] == "00:00:00.000")) {
                 Gleaders[fields[1]-1] = undefined;
               } else {
                 Gleaders[fields[1]-1] = fields[2];
@@ -408,7 +616,7 @@ function doconnect() {
                 elapsed: fields[3]
               }
               if (fields[1] == Gleaders[0]) {
-                computePassing(last_passing[fields[0]])
+                computePassing(last_passing[fields[1]])
               }
 
             } else if (fields[0] == '$I') {
@@ -423,6 +631,9 @@ function doconnect() {
               setFlag('');
               f_laps     .textContent = '';
               f_laps2go  .textContent = '';
+              f_laps2go  .style.color = '';
+              planned_laps2go = undefined;
+              estimated_laps2go = undefined;
               f_elapsed  .textContent = '--:--:--';
               f_timeleft .textContent = '--:--:--';
               f_leaders  .textContent = '';
@@ -430,7 +641,7 @@ function doconnect() {
               cars = new Object;
               classes = new Object;
               car_class = new Object;
-              is_qual = false;
+              is_qual = undefined;
               Gclass_lead = new Object;
               Gclass_lead_text = "";
               Gleaders = [];
@@ -440,8 +651,11 @@ function doconnect() {
               Hleaders = [];
               Hleaders_text = "";
               last_passing = new Object;
-              progress_start = undefined
-              progress_length = undefined
+              progress_start = undefined;
+              progress_length = undefined;
+              white_flag_warned = false;
+              console.log(`white_flag_warned set to ${white_flag_warned}`);
+              cached_scheduled_total = undefined;
               updateProgress(undefined);
             } else if (fields[0] == ':E') {
               server_error = fields[1];
