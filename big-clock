@@ -3,32 +3,52 @@
 # All Rights Reserved.
 # See LICENSE for licensing terms.
 
-import Tkinter as tk
-from idlelib.WidgetRedirector import WidgetRedirector
-import ScrolledText
-import UserDict
-import BaseHTTPServer
-import SimpleHTTPServer
-from SocketServer import ThreadingMixIn
+# April 2026 updates
+# ! Update to Python3 (3.14.4) much of the changes for that effort are noted in comments throughout the code.
+# + .ini settings file support
+# + new display mode: timing
+#   . Will show expected laps, total time and even passing close to scheduled race time and announce follow round for white flag alert.
+# + blacklist classes support: can blacklist classes so that big-block can act as a gateway controller filter the msgs from Orbits to other services
+#   . Best example is when running a TA even with TD mixed in and using transponders on all for better gridding support. Blacklist TD class and connect the Race-Monitor to 
+#   . big-clock's rmon relay (9966) and no TD classes or drivers in those classes can reach the living timing output.
+
+# [PY3 UPDATE] 'Tkinter' was renamed to lowercase 'tkinter'
+import tkinter as tk
+# [PY3 UPDATE] 'WidgetRedirector' was moved into 'idlelib.redirector'
+from idlelib.redirector import WidgetRedirector
+# [PY3 UPDATE] 'ScrolledText' was moved into 'tkinter.scrolledtext'
+import tkinter.scrolledtext as ScrolledText
+# [PY3 UPDATE] 'UserDict' was deprecated. We now use 'collections.abc'
+import collections.abc 
+# [PY3 UPDATE] BaseHTTPServer and SimpleHTTPServer were merged into 'http.server' import classes directly
+from http.server import HTTPServer, SimpleHTTPRequestHandler
+# [PY3 UPDATE] 'SocketServer' was renamed to lowercase 'socketserver'
+from socketserver import ThreadingMixIn
 import socket
 import zeroconf
 import struct
 import hashlib
 import threading
-import Queue
-import codecs
+# [PY3 UPDATE] 'Queue' was renamed to lowercase 'queue'
+import queue as Queue
 import base64
 import array
 import time
-import json
+try:
+    import ujson as json
+except ImportError:
+    import json
 import os
 import sys
-import signal
 import csv
 import argparse
-from traceback import format_exc as format
+import configparser
+# [PY3 UPDATE] Imported traceback properly instead of alias to fix formatting calls
+import traceback
+# [PY3 UPDATE] Added 'io' to handle decoding byte streams to text streams for sockets
+import io 
 
-server_version = '1.2'
+server_version = '1.3-Screech'
 
 config_int = { 'http_port', 'rmon_port', 'rmrelay_port',
         'data_port', 'console_port', 'monitor_port' }
@@ -41,6 +61,11 @@ wsMaxPings = 3
 have_syslog = False
 gui_app = None
 ReExec = False
+car_positions = {}  # Cache for graceful removal of blacklisted classes in the lead
+last_seen_packets = {}  # Cache for deduplication
+blacklist_driver_ids = set()    # IDs of drivers to filter
+blacklist_class_ids = set()     # Class IDs to filter
+current_session_id = "95" # Default to idle/stopped
 
 try:
     import fcntl
@@ -57,48 +82,127 @@ try:
 except ImportError:
     pass
 
-
-class TkConfigVars(UserDict.DictMixin):
-    def __init__(self,data,intkeys={}):
+# [PY3 UPDATE] DictMixin was removed. Replaced with collections.abc.MutableMapping
+# Added __delitem__ and __len__ which are now required. iterkeys() changed to iter().
+class TkConfigVars(collections.abc.MutableMapping):
+    def __init__(self,data,intkeys=None):
+        if intkeys is None: intkeys = set()
         self.data = {}
+        self.last_known = {} 
         for (k,v) in data.items():
-            if k in intkeys: self.data[k] = tk.IntVar()
-            else:            self.data[k] = tk.StringVar()
-            self.data[k].set(v)
-    def __getitem__(self,key):     return self.data[key].get()
-    def __setitem__(self,key,val): self.data[key].set(val)
-    def __contains__(self,item):   return item in self.data
-    def keys(self):                return self.data.keys()
-    def __iter__(self):            return self.data.iterkeys()
-    def var(self,key):             return self.data[key]
+            self.last_known[k] = v
+            if k in intkeys: self.data[k] = tk.IntVar(value=v)
+            else:            self.data[k] = tk.StringVar(value=v)
+    def __getitem__(self,key):      
+        try:
+            val = self.data[key].get()
+            self.last_known[key] = val
+            return val
+        except (RuntimeError, tk.TclError):
+            return self.last_known.get(key)
+    def __setitem__(self,key,val):  self.data[key].set(val)
+    def __delitem__(self, key):     del self.data[key]
+    def __len__(self):              return len(self.data)
+    def __contains__(self,item):    return item in self.data
+    def keys(self):                 return self.data.keys()
+    def __iter__(self):             return iter(self.data)
+    def var(self,key):              return self.data[key]
+
+class ToolTip(object):
+    """
+    Creates a ToolTip for a given tkinter widget.
+    """
+    def __init__(self, widget, text):
+        self.widget = widget
+        self.text = text
+        self.tw = None
+        self.widget.bind("<Enter>", self.enter)
+        self.widget.bind("<Leave>", self.leave)
+
+    def enter(self, event=None):
+        # Calculate position relative to the widget
+        x = self.widget.winfo_rootx() + 25
+        y = self.widget.winfo_rooty() + 20
+        
+        # Create a floating window with no borders/titlebar
+        self.tw = tk.Toplevel(self.widget)
+        self.tw.wm_overrideredirect(True)
+        self.tw.wm_geometry("+%d+%d" % (x, y))
+        
+        # Draw the classic yellow tooltip label
+        label = tk.Label(self.tw, text=self.text, justify='left',
+                         background="#ffffe0", fg="black", relief='solid', borderwidth=1,
+                         font=("tahoma", "8", "normal"))
+        label.pack(ipadx=2, ipady=1)
+
+    def leave(self, event=None):
+        # Destroy the floating window when the mouse leaves
+        if self.tw:
+            self.tw.destroy()
+            self.tw = None
 
 def parse_args():
     global config
+
+    # Load INI file defaults
+    ini_defaults = {
+        'http_port': 8000,
+        'data_port': 9999,
+        'monitor_port': 9988,
+        'console_port': 9977,
+        'rmrelay_port': 9966,
+        'timezone': 'America/New_York',
+        'rmon_server': '127.0.0.1',
+        'rmon_port': 50000,
+        'trusted_proxies': '192.168.1.', # comma delimited list, can be full IP or missing last part with trust whole range.
+        'gui': True,
+        'syslog': False,
+        'blacklist_classes': 'TD' # comma delimited list
+    }
+
+    ini = configparser.ConfigParser()
+    if os.path.exists('big-clock.ini'):
+        ini.read('big-clock.ini')
+        if 'Settings' in ini:
+            settings = ini['Settings']
+            for key in ['http_port', 'data_port', 'monitor_port', 'console_port', 'rmrelay_port', 'rmon_port']:
+                if key in settings: ini_defaults[key] = settings.getint(key)
+            for key in ['timezone', 'rmon_server', 'trusted_proxies', 'blacklist_classes']:
+                if key in settings: ini_defaults[key] = settings.get(key)
+            for key in ['gui', 'syslog']:
+                if key in settings: ini_defaults[key] = settings.getboolean(key)
+
     parser = argparse.ArgumentParser()
     parser.add_argument('--gui',    action='store_const', const=True,
             help='Enable GUI console (default)')
     parser.add_argument('--no-gui', action='store_const', const=False, dest='gui',
             help='Disable GUI console')
-    parser.add_argument('--http-port',      type=int, metavar='PORT', default=8000,
+    parser.add_argument('--http-port',      type=int, metavar='PORT',
             help='port for web server')
-    parser.add_argument('--data-port',      type=int, metavar='PORT', default=9999,
+    parser.add_argument('--data-port',      type=int, metavar='PORT',
             help='port for data feed')
-    parser.add_argument('--monitor-port',   type=int, metavar='PORT', default=9988,
+    parser.add_argument('--monitor-port',   type=int, metavar='PORT',
             help='port for monitor connections')
-    parser.add_argument('--console-port',   type=int, metavar='PORT', default=9977,
+    parser.add_argument('--console-port',   type=int, metavar='PORT',
             help='port for console connections')
-    parser.add_argument('--rmrelay-port',   type=int, metavar='PORT', default=9966,
+    parser.add_argument('--rmrelay-port',   type=int, metavar='PORT',
             help='port for rmonitor relay connections')
+    parser.add_argument('--trusted-proxies',
+            help='Comma separated list of trusted proxy IPs/subnets')
+    parser.add_argument('--blacklist-classes',
+            help='Comma separated list of classes to blacklist')
     if have_syslog:
         parser.add_argument('--syslog', action='store_const', const=True,
                 help='Send logs to syslog')
-    parser.add_argument('--timezone',       default='America/New_York',
+    parser.add_argument('--timezone',
             help='timezone for clock display')
     parser.add_argument('--version', action='version', version=server_version)
     parser.add_argument('rmon_server', metavar='rmon-server', nargs='?',
-            help='rmonitor server name/address', default='127.0.0.1')
+            help='rmonitor server name/address')
     parser.add_argument('rmon_port',   metavar='rmon-port', nargs='?', type=int,
-            help='rmonitor server port', default=50000)
+            help='rmonitor server port')
+
+    parser.set_defaults(**ini_defaults)
     config = vars(parser.parse_args())
     if config['gui'] == None: config['gui'] = True
     if not have_syslog: config['syslog'] = False
@@ -137,6 +241,7 @@ class AddressMapper(object):
         if client['name'] == None:
             self.queue.put(client)
     def remove_service(self, zc, type_, name): pass
+    def update_service(self, zeroconf, type_, name): pass
     def add_service(self, zc, type_, name):
         if type_ == ZC_SERVICES_TYPE:
             log(None, "ZC add service: %s" % name)
@@ -147,8 +252,8 @@ class AddressMapper(object):
             except zeroconf.BadTypeInNameException: pass
         else:
             info = zc.get_service_info(type_, name)
-            if len(info.address) == 4:
-                addr_str = socket.inet_ntoa(info.address)
+            if info.addresses and len(info.addresses[0]) == 4:
+                addr_str = socket.inet_ntoa(info.addresses[0])
                 shortname = info.get_name()
                 log(None, "ZC add mapping: %s -> %s" % (addr_str, shortname))
                 self.addr_map[addr_str] = shortname
@@ -164,27 +269,24 @@ class AddressMapper(object):
                 client['name'] = shortname
             except: pass
 
-class MyHTTPRequestHandler(SimpleHTTPServer.SimpleHTTPRequestHandler):
+class MyHTTPRequestHandler(SimpleHTTPRequestHandler):
     protocol_version = "HTTP/1.0"
 
     def setup(self):
         self.timeout = 15
-        SimpleHTTPServer.SimpleHTTPRequestHandler.setup(self)
+        SimpleHTTPRequestHandler.setup(self)
 
     def send_head(self):
-        #log("%s:%d" % self.client_address, "send_head %s" % self.path)
         if self.path == "/":
             self.send_response(301)
             self.send_header("Location", "/big-clock.html")
-            # avoid sending our cache control headers for this redirect
-            SimpleHTTPServer.SimpleHTTPRequestHandler.end_headers(self)
+            SimpleHTTPRequestHandler.end_headers(self)
             return None
-        return SimpleHTTPServer.SimpleHTTPRequestHandler.send_head(self)
-
+        return SimpleHTTPRequestHandler.send_head(self)
 
     def end_headers(self):
         self.send_my_headers()
-        SimpleHTTPServer.SimpleHTTPRequestHandler.end_headers(self)
+        SimpleHTTPRequestHandler.end_headers(self)
 
     def send_my_headers(self):
         self.send_header("Pragma", "no-cache")
@@ -202,16 +304,20 @@ class MyHTTPRequestHandler(SimpleHTTPServer.SimpleHTTPRequestHandler):
     def copyfile(self, source, outputfile):
         name = source.name[ source.name.replace('\\','/').rfind('/')+1 : ]
         if not name.startswith('big-clock.'):
-            return SimpleHTTPServer.SimpleHTTPRequestHandler.copyfile(
+            return SimpleHTTPRequestHandler.copyfile(
                     self, source, outputfile)
         s = os.fstat(source.fileno())
         stamp = time.strftime('%y%m%d-%H%M%S', time.localtime(s.st_mtime))
-        outputfile.write(source.read().replace('@@@@@@-@@@@@@',stamp))
+        # [PY3 UPDATE] Reading/writing HTTP files occurs in binary (bytes).
+        # We must prefix string replacements with 'b' and encode the stamp string.
+        outputfile.write(source.read().replace(b'@@@@@@-@@@@@@', stamp.encode('utf-8')))
 
-class MyHTTPServer(ThreadingMixIn, BaseHTTPServer.HTTPServer):
+class MyHTTPServer(ThreadingMixIn, HTTPServer):
+    allow_reuse_address = True
+    allow_reuse_port = True
     def __init__(self, *args, **kwargs):
         self.daemon_threads = True
-        BaseHTTPServer.HTTPServer.__init__(self, *args, **kwargs)
+        HTTPServer.__init__(self, *args, **kwargs)
         cloexec(self.socket)
 
 
@@ -245,31 +351,29 @@ class TCPAcceptServer(object):
                     self.socket = newsock
                     port = newport
                     log(None, '%s listening on port %d' % (self.ctype, port))
-                except IOError, e:
+                # [PY3 UPDATE] Changed comma syntax to 'as e'
+                except OSError as e:
                     log(None, '%s _setupSocket: %s' % (self.ctype, e.args[0]))
             try:
                 conn, addr = self.socket.accept()
-            except Exception, e:
+            except Exception as e:
                 err = e.args[0]
                 if err == 'timed out':
                     continue
                 if self.SERVER_ACTIVE:
-                    # ignore socket errors if we're shutting down
-                    print(format())
+                    print(traceback.format_exc())
                     print(e)
                     self.SERVER_ACTIVE = False
                     return
                 else:
                     break
-            peer = '%s:%d' % addr
-            log(peer, '%s client connected' % self.ctype)
             try:
                 cloexec(conn)
                 conn.settimeout(5)
-            except Exception, e:
+            except Exception as e:
                 conn.close()
-                log(peer, str(type(e)))
-                print(format())
+                log(f"{addr[0]}:{addr[1]}", str(type(e)))
+                print(traceback.format_exc())
                 print(e)
             self.handleClient(conn, addr)
         log(None, 'Shutting down %s server port: %s' % (self.ctype, port))
@@ -308,6 +412,7 @@ class TCPUserServer(TCPAcceptServer):
 # WebSocket server code adapted from
 # https://gist.github.com/sadatanwar/222d4643c25f72293461
 
+
 class WSProtocolError(Exception): pass
 class WSHandshakeError(WSProtocolError): pass
 
@@ -315,7 +420,8 @@ GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 def create_hash(key):
     reply = key + GUID
-    sh1 = hashlib.sha1(reply)
+    # [PY3 UPDATE] hashlib requires bytes, not strings. Ensure encoding.
+    sh1 = hashlib.sha1(reply.encode('utf-8'))
     return sh1.digest()
 
 def parse_headers(data, headers):
@@ -331,15 +437,29 @@ def parse_headers(data, headers):
         if len(parts) == 2:
             headers[parts[0]] = parts[1]
 
+def is_trusted_proxy(socket_ip):
+    trusted_proxies_str = config.get('trusted_proxies', '')
+    trusted_entries = [ip.strip() for ip in trusted_proxies_str.split(',') if ip.strip()]
+    
+    for entry in trusted_entries:
+        if entry.endswith('.') and socket_ip.startswith(entry):
+            return True
+        elif socket_ip == entry:
+            return True
+            
+    return False
+
 # Conduct handshake.  Possible return values:
 #   - 'WS'       WebSocket client
 #   - 'CONSOLE'  console client (accepts console commands)
 #   - 'MONITOR'  monitor client (read-only)
+
 def handshake(conn, peer):
     log(peer, 'Starting handshake')
     headers = {}
     while None not in headers:
-        data = conn.recv(1024)
+        # [PY3 UPDATE] Sockets return bytes. Decode it to string for header parsing.
+        data = conn.recv(1024).decode('utf-8', errors='ignore')
         if not data: raise EOFError
         parse_headers(data, headers)
 
@@ -348,14 +468,17 @@ def handshake(conn, peer):
     digest = create_hash(
         headers['Sec-WebSocket-Key']
     )
-    encoded_data = base64.b64encode(digest)
+    # [PY3 UPDATE] base64 returns bytes, decode it to string so we can use % substitution
+    encoded_data = base64.b64encode(digest).decode('utf-8')
     shake = "HTTP/1.1 101 Web Socket Protocol Handshake\r\n"
     shake += "Upgrade: WebSocket\r\n"
     shake += "Connection: Upgrade\r\n"
     shake += "Sec-WebSocket-Accept: %s\r\n\r\n" % encoded_data
-    conn.send(shake)
+    # [PY3 UPDATE] Sockets require bytes. Encode string payload.
+    conn.send(shake.encode('utf-8'))
     log(peer, 'WebSocket handshake successful')
-    return 'WS'
+    # [PY3 UPDATE] Return headers so addClient can read X-Forwarded-For
+    return 'WS', headers
 
 
 class WebSocketServer(object):
@@ -364,7 +487,7 @@ class WebSocketServer(object):
         self.SERVER_ACTIVE = True
         self.POLLER_ACTIVE = False
         self.WATCHDOG_ACTIVE = False
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.new_client_data = {}
 
     def _initClient(self,client):
@@ -374,49 +497,64 @@ class WebSocketServer(object):
             self.sendJSON(item[1], clients=[client])
 
     def addr_map(self, addr, name):
-        for c in filter(lambda x: x['address'] == addr, self.clients.values()):
+        # [PY3 UPDATE] Wrapped filter in list() because Py3 filter returns an iterator
+        for c in list(filter(lambda x: x['address'] == addr, self.clients.values())):
             c['name'] = name
             if gui_app: gui_app.update_client_name(c)
 
-    def addClient(self, conn, addr, clientType):
-        peer = '%s:%d' % addr
+    def addClient(self, conn, addr, clientType_with_headers):
+        # [PY3 UPDATE] Handshake was changed to return a tuple. Unpack it.
+        clientType, headers = clientType_with_headers if isinstance(clientType_with_headers, tuple) else (clientType_with_headers, {})
+
+        socket_ip, socket_port = addr
+        real_ip = socket_ip
+        if is_trusted_proxy(socket_ip) and 'X-Forwarded-For' in headers:
+            real_ip = headers['X-Forwarded-For'].split(',')[0].strip()
+
+        peer_str = f"{real_ip}:{socket_port}"
+        if real_ip != socket_ip:
+            peer_str += f" (via {socket_ip})"
+
+        log(peer_str, f'{clientType} client connected')
+
         try:
-            clientCode = conn.__hash__()
+            clientCode = hash(conn) # [PY3 UPDATE] conn.__hash__() is replaced with hash()
+            
             client = {
                     'id': clientCode,
-                    'address': addr[0],
-                    'port': addr[1],
-                    'peer': peer,
+                    'address': socket_ip,
+                    'realAddress': real_ip,
+                    'port': socket_port,
+                    'peer': peer_str,
                     'name': None,
                     'conn': conn,
                     'type': clientType,
                     'squelch': False,
                     'alive': True,
                     'last_pong': time.time(),
-                    'user_agent'   : '???',
-                    'version_html' : '???',
-                    'version_css'  : '???',
-                    'version_js'   : '???',
-                    'options'      : '-',
+                    'user_agent': '???',
+                    'version_html': '???',
+                    'version_css': '???',
+                    'version_js': '???',
+                    'options': '-',
                     }
             addrmapper.lookup(client)
             with self.lock:
                 self._initClient(client)
                 self.clients[clientCode] = client
                 if gui_app: gui_app.add_client(client)
-                conn = None
+
+                # Assign threads based on type
                 if clientType == 'WS':
-                    client_thr = threading.Thread(target=self._wsClient,
-                            args=(client,))
-                    client_thr.name = 'client ' + peer
+                    client_thr = threading.Thread(target=self._wsClient, args=(client,))
+                    client_thr.name = 'client ' + peer_str
                     client_thr.daemon = True
                     client_thr.start()
                 if clientType == 'CONSOLE':
                     client['squelch'] = True
                     if gui_app: gui_app.update_client_sql(client)
-                    client_thr = threading.Thread(target=self._consClient,
-                            args=(client,))
-                    client_thr.name = 'client ' + peer
+                    client_thr = threading.Thread(target=self._consClient, args=(client,))
+                    client_thr.name = 'client ' + peer_str
                     client_thr.daemon = True
                     client_thr.start()
                 if not self.POLLER_ACTIVE:
@@ -425,10 +563,11 @@ class WebSocketServer(object):
                     poller_thr.name = 'poller'
                     poller_thr.daemon = True
                     poller_thr.start()
-        except Exception, e:
+        # [PY3 UPDATE] Changed comma syntax to 'as e'
+        except Exception as e:
             if conn: conn.close()
-            log(peer, str(type(e)))
-            print(format())
+            log(peer_str, str(type(e)))
+            print(traceback.format_exc())
             print(e)
 
     def _setupSocket(self, port):
@@ -456,30 +595,30 @@ class WebSocketServer(object):
                     log(None, 'Data feed listening on port %d' % port)
                     log(None, 'Reloading all clients due to feed port change')
                     self.sendJSON([':R'])
-                except IOError, e:
+                except OSError as e:
                     log(None, '_setupSocket: %s' % e.args[0])
             try:
                 conn, addr = s.accept()
-            except Exception, e:
+            except Exception as e:
                 err = e.args[0]
                 if err == 'timed out':
                     continue
-                print(format())
+                print(traceback.format_exc())
                 print(e)
                 self.SERVER_ACTIVE = False
                 return
-            peer = '%s:%d' % addr
-            log(peer, 'Client connected')
+            peer_for_handshake = '%s:%d' % addr
             try:
                 cloexec(conn)
                 conn.settimeout(5)
-                clientType = handshake(conn, peer)
-            	self.addClient(conn, addr, clientType)
-            except Exception, e:
+                clientType = handshake(conn, peer_for_handshake)
+                self.addClient(conn, addr, clientType)
+            except Exception as e:
                 conn.close()
-                log(peer, str(type(e)))
-                print(format())
+                log(peer_for_handshake, str(type(e)))
+                print(traceback.format_exc())
                 print(e)
+                                 
         log(None, 'Shutting down WS server port: %s' % port)
         return
 
@@ -508,7 +647,6 @@ class WebSocketServer(object):
                 mask_bits = conn.recv(4)
                 if not mask_bits: raise EOFError
                 mask_bits = bytearray(mask_bits)
-
                 # validation
                 if not payload and not opcode:
                     raise WSProtocolError('no opcode in initial packet')
@@ -527,14 +665,13 @@ class WebSocketServer(object):
                 if length > maxMessageLen - len(payload):
                     raise WSProtocolError('message too long (%d + %d > %d)'
                             % (len(payload), length, maxMessageLen))
-
                 # receive and decode data
                 data = conn.recv(length)
                 if not data: raise EOFError
-                data = bytearray(data)
-                DECODED = []
-                for i in range(0, len(data)):
-                    DECODED.append(data[i] ^ mask_bits[i % 4])
+                
+                # Fast XOR unmasking using zip and pre-multiplied mask
+                mask_repeated = (mask_bits * (len(data) // 4 + 1))[:len(data)]
+                DECODED = bytes(b ^ m for b, m in zip(data, mask_repeated))
 
             except socket.timeout:
                 continue
@@ -542,31 +679,34 @@ class WebSocketServer(object):
                 log(client['peer'], 'disconnected')
                 self._remove(client)
                 break
-            except IOError, e:
+            except OSError as e:
                 log(client['peer'], 'recv: %s' % e.args[0])
                 self._remove(client)
                 break
-            except Exception, e:
+            except Exception as e:
                 log(client['peer'], '%s: %s' % (str(type(e)), e.args[0]))
-                print(format())
+                print(traceback.format_exc())
                 print(e)
                 self._remove(client)
                 break
 
             if isctrl:
-                data = array.array('B', DECODED).tostring()
+                # [PY3 UPDATE] array.tostring() was removed. Use tobytes().
+                data = array.array('B', DECODED).tobytes()
             else:
                 payload.extend(DECODED)
                 if opcode: datatype = opcode
                 if not fin: continue
-                data = payload.tostring()
+                # [PY3 UPDATE] array.tostring() removed. tobytes() returns bytes. Decode to string for JSON parsing.
+                data = payload.tobytes().decode('utf-8', errors='ignore')
                 del payload[:]
-
             # handle complete messages
             if opcode == 0x8: # close
                 if len(data) >= 2:
-                    reason, = struct.unpack('!H', data[0:2])
-                    message = data[2:]
+                    # [PY3 UPDATE] Python 3 unpack requires a bytes-like object, ensure it's sliced bytes.
+                    data_bytes = data if isinstance(data, bytes) else data.encode('utf-8')
+                    reason, = struct.unpack('!H', data_bytes[0:2])
+                    message = data_bytes[2:].decode('utf-8', errors='ignore')
                     log(client['peer'], 'connection closed (%d): %s'
                             % (reason,message))
                 else:
@@ -577,7 +717,6 @@ class WebSocketServer(object):
             elif opcode == 0xa or (not isctrl and data == "pong"): # pong
                 client['last_pong'] = time.time()
                 if gui_app: gui_app.update_client_pong(client)
-                #log(client['peer'], 'pong')
             elif isctrl:
                 log(client['peer'], 'unknown control message %x' % opcode)
             else:
@@ -586,7 +725,8 @@ class WebSocketServer(object):
     def _consClient(self, client):
         conn = client['conn']
         conn.setblocking(True)
-        f = conn.makefile('rU')
+        # [PY3 UPDATE] 'rU' is deprecated. Replaced with universal newlines mode 'r' and utf-8 decoding
+        f = conn.makefile('r', encoding='utf-8', newline='')
         while client['alive']:
             try:
                 line = f.readline()
@@ -599,13 +739,13 @@ class WebSocketServer(object):
                 log(client['peer'], 'disconnected')
                 self._remove(client)
                 break
-            except IOError, e:
+            except OSError as e:
                 log(client['peer'], 'recv: %s' % e.args[0])
                 self._remove(client)
                 break
-            except Exception, e:
+            except Exception as e:
                 log(client['peer'], '%s: %s' % (str(type(e)), e.args[0]))
-                print(format())
+                print(traceback.format_exc())
                 print(e)
                 self._remove(client)
                 break
@@ -620,7 +760,6 @@ class WebSocketServer(object):
         pingTimeout = wsPingPeriod * wsMaxPings + 3
         try:
             while self.SERVER_ACTIVE:
-                #log(None, 'Pinging %d clients' % len(self.clients))
                 self.sendData('BigClock', opcode=0x9)
                 now = time.time()
                 for client in self.clients.values():
@@ -643,9 +782,9 @@ class WebSocketServer(object):
                     while time.time() < now + wsPingPeriod:
                         self.sendJSON([])
                         time.sleep(1)
-        except Exception, e:
+        except Exception as e:
             self.POLLER_ACTIVE = False
-            print(format())
+            print(traceback.format_exc())
             print(e)
 
     def watchdog_disable(self):
@@ -667,12 +806,12 @@ class WebSocketServer(object):
         ws_server_thr.start()
 
     def sendData(self, data, fin=True, opcode=1, masking_key=False,
-            clients=None, allClients=False, fields=None):
+            clients=None, allClients=False, fields=None, raw_bytes=None):
         if fin > 0x1:
             raise ValueError('FIN bit parameter must be 0 or 1')
         if 0x3 <= opcode <= 0x7 or 0xB <= opcode:
             raise ValueError('Opcode cannot be a reserved opcode')
-
+    
         ## +-+-+-+-+-------++-+-------------+-------------------------------+
         ## |F|R|R|R| opcode||M| Payload len |    Extended payload length    |
         ## |I|S|S|S|  (4)  ||A|     (7)     |             (16/63)           |
@@ -710,29 +849,37 @@ class WebSocketServer(object):
             elif length < (1 << 63):
                 header += struct.pack('!B', (mask_bit | 127)) + struct.pack('!Q', length)
 
-            body = data
+            # [PY3 UPDATE] Ensure body is bytes before concatenating and sending over socket.
+            body = data.encode('utf-8') if isinstance(data, str) else data
+            
             if clients == None:
-                with self.lock: clients = self.clients.values()
+                with self.lock: clients = list(self.clients.values())
                 if not allClients:
                     clients = [c for c in clients if not c['squelch']]
             for client in clients:
                 try:
                     if client['type'] == 'WS':
-                        client['conn'].send(bytes(header + body))
+                        client['conn'].send(header + body)
                     elif client['type'] in { 'CONSOLE', 'MONITOR'}:
-                        client['conn'].send(bytes(body + '\r\n'))
+                        # [PY3 UPDATE] Ensure newline string is converted to bytes to concatenate
+                        client['conn'].send(body + b'\r\n')
+                    elif client['type'] == 'RMON' and raw_bytes:
+                        with self.lock:
+                            client['conn'].send(raw_bytes)
                     elif client['type'] == 'RMON' and fields:
-                        client['conn'].send(bytes(','.join(fields) + '\r\n'))
-                except IOError, e:
+                        csv_line = ','.join(fields) + '\r\n'
+                        with self.lock:                            
+                            client['conn'].send(csv_line.encode('utf-8'))
+                except OSError as e:
                     log(client['peer'], 'send: %s' % e.args[0])
                     self._remove(client)
-        except Exception, e:
-            print(format())
+        except Exception as e:
+            print(traceback.format_exc())
             print(e)
 
-    def sendJSON(self, fields, clients=None, allClients=False):
+    def sendJSON(self, fields, clients=None, allClients=False, raw_bytes=None):
         self.sendData(json.dumps(fields), fields=fields,
-                clients=clients, allClients=allClients)
+                clients=clients, allClients=allClients, raw_bytes=raw_bytes)
 
     def sendMessage(self, message):
         fields = [':M', message]
@@ -750,13 +897,13 @@ class WebSocketServer(object):
         try:
             client['alive'] = False
             client['conn'].close()
-        except Exception, e:
+        except Exception as e:
             print(e)
-            print(format())
+            print(traceback.format_exc())
 
     def close(self):
         self.SERVER_ACTIVE = False
-        for client in self.clients.values():
+        for client in list(self.clients.values()):
             self._remove(client)
 
     def handleData(self, client, opcode, data):
@@ -765,7 +912,7 @@ class WebSocketServer(object):
             return
         try:
             fields = json.loads(data)
-        except Exception, e:
+        except Exception as e:
             log(client['peer'], str(type(e)))
             return
         if fields[0] == '%O':
@@ -810,9 +957,10 @@ class WebSocketServer(object):
             reply("BigClock server v%s" % (server_version))
 
         elif fields[0] == "config":
-            if len(fields) == 1:   # print config
-                for opt in sorted(filter(
-                    lambda x: x not in config_hide, config.keys())):
+            if len(fields) == 1:   
+                # [PY3 UPDATE] filter returns iterator, wrapped in list()
+                for opt in sorted(list(filter(
+                    lambda x: x not in config_hide, config.keys()))):
                     reply("%-15s %s" % (opt, config[opt]), nl=False)
                 reply(None)
             elif len(fields) == 2: # print one config item
@@ -844,7 +992,7 @@ class WebSocketServer(object):
                 return
             c = self._findClient(fields[1])
             if not c:
-                reply("unknown client %s" % spec)
+                reply("unknown client %s" % fields[1])
                 return
             reply("changing client %x options" % c['id'])
             self.sendJSON([':OPT', fields[2]], clients=[c])
@@ -858,7 +1006,7 @@ class WebSocketServer(object):
                 return
             c = self._findClient(fields[1])
             if not c:
-                reply("unknown client %s" % spec)
+                reply("unknown client %s" % fields[1])
                 return
             reply("naming %x as %s" % (c['id'],fields[2]))
             c['name'] = fields[2]
@@ -879,7 +1027,8 @@ class WebSocketServer(object):
 
         elif fields[0] == "refresh":
             if len(fields) >= 2:
-                cc = filter(None, [ self._findClient(c) for c in fields[1:] ])
+                # [PY3 UPDATE] filter behavior modified 
+                cc = list(filter(None, [ self._findClient(c) for c in fields[1:] ]))
                 clist = ','.join(['%x' % c['id'] for c in cc])
                 reply('Refreshing %s' % clist)
             else:
@@ -889,7 +1038,7 @@ class WebSocketServer(object):
 
         elif fields[0] == "reload":
             if len(fields) >= 2:
-                cc = filter(None, [ self._findClient(c) for c in fields[1:] ])
+                cc = list(filter(None, [ self._findClient(c) for c in fields[1:] ]))
                 clist = ','.join(['%x' % c['id'] for c in cc])
                 reply('Reloading %s' % clist)
             else:
@@ -924,8 +1073,10 @@ class WebSocketServer(object):
                 fl = '>' if c is client else '-' if not c['alive'] else ' '
                 fl += 'S' if c['squelch'] else ' '
                 ts = time.strftime('%H:%M:%S', time.localtime(c['last_pong']))
+                # Modified the string here to print realAddress if available, fallback to address. Use the existing port logic from peer string or port directly
+                address_str = f"{c.get('realAddress', c['address'])}:{c['port']}"
                 msg += "%s %12x  %-7s  %-8s  %-21s  %s\n" % (
-                        fl, c['id'], c['type'], ts, c['peer'], c['name'])
+                        fl, c['id'], c['type'], ts, address_str, c['name'])
                 if len(fields) > 1 and fields[1] == '-v' and c['type'] == 'WS':
                     msg += "   %s\n   HTML %s / CSS %s / JS %s\n   %s\n\n" % (
                             c['user_agent'], c['version_html'],
@@ -981,7 +1132,7 @@ class RMonitorPushServer(TCPAcceptServer):
         if self.relay.RELAY_ACTIVE:
             self.relay.kill()
             self.relay._wait()
-
+        
         # Start a new relay thread
         server_thread = threading.Thread(
                 target=self.relay._run_once, args=(conn,))
@@ -995,6 +1146,7 @@ class RMonitorRelay(object):
         self.server = None
         self.socket = None
         self.rmon_file = None
+        self.rmon_file_raw = None
         self.RELAY_ACTIVE = False
         self.SHUTDOWN = False
         self.shutdown_complete = threading.Event()
@@ -1009,6 +1161,13 @@ class RMonitorRelay(object):
                     pass
                 finally:
                     self.rmon_file = None
+            if self.rmon_file_raw:
+                try:
+                    self.rmon_file_raw.close()
+                except:
+                    pass
+                finally:
+                    self.rmon_file_raw = None
             if self.socket:
                 try:
                     self.socket.shutdown(socket.SHUT_RDWR)
@@ -1034,11 +1193,19 @@ class RMonitorRelay(object):
         try:
             cloexec(self.socket)
             self.socket.setblocking(True)
-            self.rmon_file = self.socket.makefile("rb")
-            rmon_csv = csv.reader(self.rmon_file)
+            # [PY3 UPDATE] Use io.TextIOWrapper to automatically decode the incoming binary
+            # TCP stream using CP1252 encoding to produce Python 3 strings for csv.reader.
+            self.rmon_file_raw = self.socket.makefile("rb")
+            self.rmon_file = io.TextIOWrapper(self.rmon_file_raw, encoding='cp1252', newline='')
+            # removed to sync output format to input rmon_csv = csv.reader(self.rmon_file)
         except:
             self._close()
             raise
+
+        # --- INIT GLOBAL STATE FOR FILTERING ---
+        global current_session_id, blacklist_driver_ids, blacklist_class_ids, last_seen_packets, car_positions
+        # Convert the INI list (e.g., "TD, GUEST") into an uppercase Set for fast lookups
+        target_class_names = {c.strip().upper() for c in config.get('blacklist_classes', '').split(',') if c.strip()}
 
         try:
             log(None, 'RMonitor feed connected')
@@ -1046,11 +1213,104 @@ class RMonitorRelay(object):
             if gui_app: gui_app.relay_state(True)
 
             while self.RELAY_ACTIVE:
-                try: fields = rmon_csv.next()
-                except StopIteration: break
+                raw_bytes = self.rmon_file_raw.readline()
+                if not raw_bytes: break
+                raw_line = raw_bytes.decode('cp1252', errors='ignore')
+                if not raw_line: break
+                try: 
+                    fields = next(csv.reader([raw_line.strip() ]))
+                except StopIteration: 
+                    continue
                 if not fields:
                     break
-                fields = [ codecs.decode(x, 'cp1252') for x in fields ]
+                msg_type = fields[0]
+                with self.ws.lock:
+                    ws_clients = [c for c in self.ws.clients.values() if c['type'] == 'WS']
+                    monitor_clients = [c for c in self.ws.clients.values() if c['type'] == 'MONITOR']
+
+                # --- 1. STATE TRACKING ($B & $I) ---
+                if msg_type == '$B' and len(fields) > 1:
+                    current_session_id = fields[1]
+                elif msg_type == '$I':
+                    blacklist_driver_ids.clear()
+                    blacklist_class_ids.clear()
+                    last_seen_packets.clear()
+                    car_positions.clear()
+                    # Send special packet to big-clock.js so the dashboard knows what's filtered
+                    if target_class_names and ws_clients:
+                        self.ws.sendJSON(['$FILTER_INFO', ', '.join(target_class_names)], clients=ws_clients)
+
+
+                # --- 3. DEDUPLICATION FILTER ($E and bursts) ---
+                # Key is '$E' + 'SETTING' (e.g., $ETRACKNAME) or just the type ($I, $B)
+                cache_key = msg_type + fields[1] if (msg_type == '$E' and len(fields) > 1) else msg_type
+                if last_seen_packets.get(cache_key) == raw_line:
+                    continue  # Skip duplicate packet
+                last_seen_packets[cache_key] = raw_line
+
+                # --- 4. SHADOWBAN FILTER ($COMP, $G, $H) ---
+                drop_packet = False
+                if msg_type in {'$G', '$H'}:
+                    comp_id = fields[2]
+                    try:
+                        orig_pos = int(fields[1])
+                        car_positions[comp_id] = orig_pos
+                    except ValueError:
+                        orig_pos = 9999
+                    if current_session_id == "95":
+                        drop_packet = True # Block timing while idle
+                    elif len(fields) > 2 and fields[2] in blacklist_driver_ids:
+                        drop_packet = True # Block blacklisted driver times
+                    else:
+                        valid_drivers_ahead = sum(1 for cid, p in car_positions.items() 
+                                                  if p < orig_pos and cid  not in blacklist_driver_ids)
+                        adj_pos = valid_drivers_ahead + 1
+                        if orig_pos != adj_pos:
+                            self.ws.sendJSON(['$DEBUG', f"Moving {comp_id} from {orig_pos} to {adj_pos}"], clients=monitor_clients)
+                            fields[1] = str(adj_pos)
+                            parts = raw_line.split(',',2)
+                            if len(parts) == 3:
+                                parts[1] = str(adj_pos)
+                                new_raw_line = ','.join(parts) 
+                                raw_bytes = new_raw_line.encode('cp1252')
+
+                elif msg_type == '$A':
+                    if len(fields) > 7 and fields[7] in blacklist_class_ids:
+                        drop_packet = True
+                elif msg_type in {'$SP', '$SR'} and len(fields) > 3: 
+                    car_id = fields[2]
+                    class_id = fields[3]
+                    if car_id in blacklist_driver_ids:
+                        drop_packet = True
+                elif msg_type == '$J':
+                    if len(fields) > 1 and fields[1] in blacklist_driver_ids:
+                        drop_packet = True
+                elif msg_type == '$COMP' and len(fields) > 3:
+                    comp_id = fields[1]
+                    comp_class_id = fields[3]
+                    if comp_id in blacklist_driver_ids:
+                        drop_packet = True 
+                    elif comp_class_id in blacklist_class_ids and not comp_id in blacklist_driver_ids:
+                        blacklist_driver_ids.add(comp_id)
+                        self.ws.sendJSON(['$DEBUG', f"Added driver id {comp_id} to blacklist_driver_ids"], clients=monitor_clients)
+                        drop_packet = True
+                elif msg_type == '$C' and len(fields) > 2:
+                    try:
+                        c_id = fields[1]
+                        c_class = fields[2].upper()
+                        if c_id in blacklist_driver_ids:
+                            drop_packet = True
+                        elif any(blacklisted in c_class for blacklisted in target_class_names):
+                            blacklist_class_ids.add(c_id)
+                            self.ws.sendJSON(['$DEBUG', f"Added class id {c_id} to blacklist_class_ids"], clients=monitor_clients)
+                            drop_packet = True
+                    except: pass
+
+                # If packet fails the filter, skip processing and do NOT send to clients
+                if drop_packet:
+                    continue
+
+                # --- 5. EXISTING RELAY PROCESSING ---
                 jd = json.dumps(fields)
                 if gui_app: gui_app.report(jd)
                 #else: sys.stdout.write(jd + '\n')
@@ -1067,8 +1327,12 @@ class RMonitorRelay(object):
                     self.ws.new_client_data[ '%s%3d' % (fields[0], int(fields[1])) ] = fields
                 elif fields[0] in {'$B'}:
                     self.ws.new_client_data[fields[0]] = fields
+                
                 if watchdog: self.ws.watchdog_update()
-                self.ws.sendJSON(fields)
+                
+                # Broadcasts to WS (big-clock.js) and RMON (Race-Monitor)
+                self.ws.sendJSON(fields, raw_bytes=raw_bytes) 
+                
                 if not error_cleared:
                     self.ws.sendError('')
                     error_cleared = True
@@ -1085,8 +1349,7 @@ class RMonitorRelay(object):
                 try:
                     self._connect()
                     self._relay()
-                except socket.error as e:
-                    # ignore socket errors if we're shutting down
+                except OSError as e:
                     if self.RELAY_ACTIVE:
                         log(None, str(e))
                         ws.sendError('Lost rmonitor feed')
@@ -1103,8 +1366,7 @@ class RMonitorRelay(object):
 
         try:
             self._relay(watchdog=False)
-        except socket.error as e:
-            # ignore socket errors if we're shutting down
+        except OSError as e:
             if self.RELAY_ACTIVE:
                 log(None, str(e))
                 ws.sendError('Lost rmonitor feed')
@@ -1193,23 +1455,33 @@ class BigClockClient(object):
     def __init__(self, master, client):
         self.client = client
         self.sql_v  = tk.BooleanVar()
+        self.cid_v  = tk.StringVar()
+        self.type_v = tk.StringVar()
         self.pong_v = tk.StringVar()
         self.name_v = tk.StringVar()
+        self.peer_v = tk.StringVar()
+
+        self.sql_v.set(client['squelch'])
+        self.cid_v.set('%x' % client['id'])
+        self.type_v.set(client['type'])
         self.set_pong(client['last_pong'])
         if client['name']: self.set_name(client['name'])
+        address_text = f"{client.get('realAddress', client['address'])}:{client['port']}"
+        self.peer_v.set(address_text)
 
         self.sql_btn = tk.Checkbutton(master, onvalue=True, offvalue=False,
                 anchor=tk.CENTER, borderwidth=0, bg='white', highlightbackground='white',
                 variable=self.sql_v, command=self.squelch_pushed)
-        self.cid  = tk.Label(master, bg='white', anchor=tk.W, width=10, text='%x' % client['id'])
-        self.type = tk.Label(master, bg='white', anchor=tk.W, width= 8, text=client['type'])
-        self.pong = tk.Label(master, bg='white', anchor=tk.W, width= 8, textvariable=self.pong_v)
-        self.name = tk.Label(master, bg='white', anchor=tk.W, width=15, textvariable=self.name_v)
-        self.peer = tk.Label(master, bg='white', anchor=tk.W, width=15, text=client['peer'])
+        self.cid  = tk.Label(master, bg='white', fg='black', anchor=tk.W, width=10, textvariable=self.cid_v)
+        self.type = tk.Label(master, bg='white', fg='black', anchor=tk.W, width= 8, textvariable=self.type_v)
+        self.pong = tk.Label(master, bg='white', fg='black', anchor=tk.W, width= 8, textvariable=self.pong_v)
+        self.name = tk.Label(master, bg='white', fg='black', anchor=tk.W, textvariable=self.name_v)
+        self.peer = tk.Label(master, bg='white', fg='black', anchor=tk.W, textvariable=self.peer_v, cursor="hand2")
         self.actions = tk.Frame(master, bg='white')
         self.push_btn   = tk.Button(self.actions, text='Push', command=self.push)
         self.reload_btn = tk.Button(self.actions, text='Reload', command=self.reload)
         self.kick_btn   = tk.Button(self.actions, text='Kick', command=self.kick)
+        self.peer.bind("<Button-1>", self.copy_peer_to_clipboard)
         self.push_btn.grid  (row=0, column=0)
         self.reload_btn.grid(row=0, column=1)
         self.kick_btn.grid  (row=0, column=2)
@@ -1226,12 +1498,12 @@ class BigClockClient(object):
     def regrid(self,row):
         self.row = row
         self.sql_btn.grid(row=row, column=0, padx=1, sticky=FILL_PARENT)
-        self.cid.grid    (row=row, column=1, padx=1, sticky=tk.N+tk.S+tk.W)
-        self.type.grid   (row=row, column=2, padx=1, sticky=tk.N+tk.S+tk.W)
-        self.pong.grid   (row=row, column=3, padx=1, sticky=tk.N+tk.S+tk.W)
-        self.name.grid   (row=row, column=4, padx=1, sticky=tk.N+tk.S+tk.W)
-        self.peer.grid   (row=row, column=5, padx=1, sticky=tk.N+tk.S+tk.W)
-        self.actions.grid(row=row, column=6, padx=1, sticky=tk.N+tk.S+tk.W+tk.E)
+        self.cid.grid    (row=row, column=1, padx=1, sticky=FILL_PARENT)
+        self.type.grid   (row=row, column=2, padx=1, sticky=FILL_PARENT)
+        self.pong.grid   (row=row, column=3, padx=1, sticky=FILL_PARENT)
+        self.name.grid   (row=row, column=4, padx=1, sticky=FILL_PARENT)
+        self.peer.grid   (row=row, column=5, padx=1, sticky=FILL_PARENT)
+        self.actions.grid(row=row, column=6, padx=1, sticky=FILL_PARENT)
 
     def push(self):
         log(None, 'refreshing %x' % self.client['id'])
@@ -1250,6 +1522,13 @@ class BigClockClient(object):
     def set_name(self,name): self.name_v.set(name)
     def set_pong(self,when): self.pong_v.set(time.strftime('%H:%M:%S', time.localtime(when)))
 
+    def copy_peer_to_clipboard(self, event):
+        self.peer.clipboard_clear()
+        self.peer.clipboard_append(self.peer_v.get())
+        original_bg = self.peer.cget("bg")
+        self.peer.config(bg="#a0e0ff")
+        self.peer.after(300, lambda: self.peer.config(bg=original_bg))
+
 class BigClockClientList(tk.Frame):
     def __init__(self, master):
         self.clients = {}
@@ -1257,33 +1536,38 @@ class BigClockClientList(tk.Frame):
         tk.Frame.__init__(self, master)
         self.columnconfigure(0, weight=1)
         self.rowconfigure(1, weight=1)
-
+        
         # Framework
         self.header_frame = hf = tk.Frame(self, bg='black')
-        self.canvas = tk.Canvas(self)
-        self.canvas.columnconfigure(0, weight=1)
-        self.canvas.rowconfigure(1, weight=1)
+        self.canvas = tk.Canvas(self, borderwidth=0)
         self._makeRows()
-        self.empty_space = tk.Canvas(self.canvas, bg='white', borderwidth=0)
         self.scrollbar = tk.Scrollbar(self, orient=tk.VERTICAL)
         self.canvas['yscrollcommand'] = self.scrollbar.set
         self.scrollbar['command'] = self.canvas.yview
+
+        self.canvas.create_window((0,0), window=self.rows, anchor='nw', tags="frame")
+        self.rows.bind("<Configure>", self.onFrameConfigure)
+        self.canvas.bind("<Configure>", self.onCanvasConfigure)
+
         self.header_frame.grid(row=0, column=0, ipady=1, sticky=tk.W+tk.E)
         self.canvas.grid(row=1, column=0, sticky=FILL_PARENT)
         self.scrollbar.grid(row=1, column=1, sticky=tk.N+tk.S)
-        self.empty_space.grid(row=1, column=0, sticky=FILL_PARENT)
-
         # Column Headers and Widths
         bgcol = '#d9d9d9'
         self.header_frame.columnconfigure(0, minsize=35)
-        self.header_frame.columnconfigure(6, minsize=200, weight=1)
+        self.header_frame.columnconfigure(1, minsize=80)
+        self.header_frame.columnconfigure(2, minsize=64)
+        self.header_frame.columnconfigure(3, minsize=64)
+        self.header_frame.columnconfigure(4, minsize=120, weight=1)
+        self.header_frame.columnconfigure(5, minsize=120, weight=1)
+        self.header_frame.columnconfigure(6, minsize=160)
         self.sql_header  = tk.Label(hf, anchor=tk.CENTER, bg=bgcol, text='Sql')
         self.cid_header  = tk.Label(hf, anchor=tk.W, bg=bgcol, width=10, text='Client ID')
         self.type_header = tk.Label(hf, anchor=tk.W, bg=bgcol, width= 8, text='Type')
         self.pong_header = tk.Label(hf, anchor=tk.W, bg=bgcol, width= 8, text='Last Seen')
-        self.name_header = tk.Label(hf, anchor=tk.W, bg=bgcol, width=15, text='Name')
-        self.peer_header = tk.Label(hf, anchor=tk.W, bg=bgcol, width=15, text='IP Address:Port')
-        self.act_header  = tk.Label(hf, anchor=tk.W, bg=bgcol, width=25, text='Actions')
+        self.name_header = tk.Label(hf, anchor=tk.W, bg=bgcol, text='Name')
+        self.peer_header = tk.Label(hf, anchor=tk.W, bg=bgcol, text='IP Address:Port')
+        self.act_header  = tk.Label(hf, anchor=tk.W, bg=bgcol, text='Actions')
 
         self.sql_header.grid (row=0, column=0, padx=1, sticky=FILL_PARENT)
         self.cid_header.grid (row=0, column=1, padx=1, sticky=tk.W)
@@ -1296,14 +1580,24 @@ class BigClockClientList(tk.Frame):
         self.queue = Queue.Queue()
         self.after(100, self.process_queue)
 
+    def onFrameConfigure(self, event):
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+
+    def onCanvasConfigure(self, event):
+        self.canvas.itemconfig("frame", width=event.width)
+
     def _makeRows(self):
         if getattr(self, 'rows', None):
             self.rows.grid_forget()
             self.rows.destroy()
         self.rows = tk.Frame(self.canvas, bg='black', borderwidth=0)
         self.rows.columnconfigure(0, minsize=35)
-        self.rows.columnconfigure(6, minsize=200, weight=1)
-        self.rows.grid(row=0, column=0, sticky=tk.N+tk.W+tk.E)
+        self.rows.columnconfigure(1, minsize=80)
+        self.rows.columnconfigure(2, minsize=64)
+        self.rows.columnconfigure(3, minsize=64)
+        self.rows.columnconfigure(4, minsize=120, weight=1)
+        self.rows.columnconfigure(5, minsize=120, weight=1)
+        self.rows.columnconfigure(6, minsize=160)
 
     def regrid_clients(self,key=lambda x: x.row):
         clients = sorted(self.clients.values(), key=key)
@@ -1324,8 +1618,7 @@ class BigClockClientList(tk.Frame):
                     c = self.clients.pop(client['id'], None)
                     if c: c.destroy()
                     self.n_clients = len(self.clients)
-                    if self.n_clients: self.regrid_clients()
-                    else: self._makeRows()
+                    self.regrid_clients()
                 else:
                     c = self.clients.get(client['id'])
                     if not c: continue
@@ -1371,6 +1664,7 @@ class BigClockGUI(tk.Frame):
         self.config_frame.rowconfigure(0, minsize=27)
         self.config_frame.rowconfigure(1, minsize=27)
         self.config_frame.rowconfigure(2, minsize=27)
+        self.config_frame.rowconfigure(3, minsize=27)
         self.config_frame.columnconfigure(6, weight=1)
 
         # Configuration Labels
@@ -1380,6 +1674,8 @@ class BigClockGUI(tk.Frame):
         self.cons_label = tk.Label(cf, anchor=tk.W, text="Console Port:")
         self.http_label = tk.Label(cf, anchor=tk.W, text="Web Server Port:")
         self.tz_label   = tk.Label(cf, anchor=tk.W, text="Time Zone:")
+        self.proxy_label = tk.Label(cf, anchor=tk.W, text="Trusted Proxies:")
+        self.bl_classes_label = tk.Label(cf, anchor=tk.W, text="Blacklist Classes:")
 
         # Configuration Data Fields
         self.rmon_port  = tk.Entry(cf, width=6, textvariable=config.var('rmon_port'))
@@ -1388,6 +1684,8 @@ class BigClockGUI(tk.Frame):
         self.cons_entry = tk.Entry(cf, width=6, textvariable=config.var('console_port'))
         self.mon_entry  = tk.Entry(cf, width=6, textvariable=config.var('monitor_port'))
         self.tz_entry   = tk.Entry(cf, textvariable=config.var('timezone'))
+        self.proxy_entry = tk.Entry(cf, textvariable=config.var('trusted_proxies'))
+        self.bl_classes_entry = tk.Entry(cf, textvariable=config.var('blacklist_classes'))
 
         # Reconnect button
         self.reconn_btn = tk.Button(cf, text='Reconnect', command=restart_relay)
@@ -1407,7 +1705,7 @@ class BigClockGUI(tk.Frame):
             self.rmon_host.grid(row=0, column=0, sticky=tk.W+tk.E)
             self.rmon_sep.grid (row=0, column=1, sticky=tk.E)
             self.rmon_entry.grid(row=0, column=1, sticky=tk.W+tk.E, columnspan=2)
-
+        
         # Configuration Layout
         self.rmon_port.grid (row=0, column=3, sticky=tk.W)
         self.rmon_state.grid(row=0, column=4, sticky=tk.W, columnspan=2)
@@ -1421,6 +1719,10 @@ class BigClockGUI(tk.Frame):
         self.http_entry.grid(row=2, column=1, sticky=tk.W)
         self.tz_label.grid  (row=2, column=2, sticky=tk.W)
         self.tz_entry.grid  (row=2, column=3, sticky=tk.W, columnspan=3)
+        self.proxy_label.grid(row=3, column=0, sticky=tk.W)
+        self.proxy_entry.grid(row=3, column=1, sticky=tk.W, columnspan=5)
+        self.bl_classes_label.grid(row=4, column=0, sticky=tk.W)
+        self.bl_classes_entry.grid(row=4, column=1, sticky=tk.W, columnspan=3)
         self.reconn_btn.grid(row=0, column=6, sticky=tk.NE)
         self.config_frame.grid(sticky=tk.N+tk.W+tk.E)
 
