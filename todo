@@ -1,3 +1,5 @@
+! Fix that when new client connects during an active session, it's getting the blacklisted cars 
+    and the data is not in same format as from Orbits
 - treat rmonitor feed as CP1252 instead of UTF-8
 - support rmonitor feed push e.g. from ipbroadcaster
 - propagate gui timezone changes to clients
