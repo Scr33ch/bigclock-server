@@ -13,7 +13,7 @@
     <meta http-equiv="Content-Script-Type" content="text/javascript">
 </head>
 <body onload="onLoad()" onhashchange="process_opts()">
-<div class="top" id="topdiv">
+<div class="top" id="topdiv" data-show-proj-laps="false" data-session="qual" data-mode="raceinfo" data-nologo="false" data-status="stopped">
   <div class="branding-logo"><img src="logo.png"><span class="timing-only race-only" style="vertical-align: top;"><input type="checkbox" id="wf_alert" value="1">Play white flag alert</input></span></div>
   <div class="version" id="version">BigClock <span id="version_srv">???</span>
     / HTML <span id="version_html">1.3-Screech-@@@@@@-@@@@@@</span>
@@ -35,22 +35,22 @@
             <tr><th>Laps Completed</th><th>Elapsed Tm</th></tr>
             <tr class="divider"></tr>
             <tr>
-              <td id="laps2go">----</td>
+              <td><span class="proj-rem-laps" id="est_laps2go">--</span><span class="race-only proj-rem-laps schd-laps"> / </span><span class="race-only schd-laps" id="laps2go">----</span></td>
               <td style="position:relative;">
                 <div class="close-fin close-fin-before" id="projected_above"></div>
                 <span id="timeleft">--:--:--</span>
                 <div class="close-fin close-fin-after" id="projected_below"></div>
               </td>
             </tr>
-            <tr><th>Laps Remaining</th><th>Scheduled Remaining Tm</th></tr>
+            <tr><th><span class="proj-rem-laps" id="est_laps2go">Projected</span><span class="race-only proj-rem-laps schd-laps"> / </span><span class="race-only schd-laps" id="laps2go">Scheduled</span> Laps Remaining</th><th>Scheduled Remaining Tm</th></tr>
             <tr class="divider"></tr>
             <tr class="timing-only totals">
-              <td><span class="timing-only race-only"><span id="proj_total_laps">--</span> / </span><span id="sched_total_laps">--</span></td>
-              <td><span class="timing-only race-only"><span id="proj_total">--:--:--</span> / </span><span id="sched_total">--:--</span></td>
+              <td><span class="race-only"><span id="proj_total_laps">--</span><span class="schd-laps race-only"> / </span></span><span class="schd-laps" id="sched_total_laps">--</span></td>
+              <td><span class="race-only"><span id="proj_total_tm">--:--:--</span> / </span><span id="sched_total">--:--</span></td>
             </tr>
             <tr class="timing-only">
-              <th><span class="timing-only race-only">Projected / </span>Scheduled Total Laps</th>
-              <th><span class="timing-only race-only">Projected / </span>Scheduled Total Tm (mm:ss)</th>
+              <th><span class="race-only">Projected</span><span class="schd-laps race-only"> / </span><span class="schd-laps">Scheduled</span> Total Laps</th>
+              <th><span class="race-only">Projected / </span>Scheduled Total Tm (mm:ss)</th>
             </tr>
           </table>
         </td>
