@@ -39,7 +39,7 @@ div.version {
 }
 div#logo { top: 0; left: 0; position: absolute; }
 div#logo img { width: 125px; height: 125px; }
-div#version { top: 0; left:  0; }
+div#version { top: 0; left:  125px; }
 div#options { top: 0; right: 0; }
 div.chrome43 div#logo    { top: 15px; left:  85px; }
 div.chrome43 div#version { top: 15px; left:  85px; }
@@ -110,9 +110,8 @@ table.bigtod td { font-size: 220pt; font-weight: bold; text-align: center; }
 div.chrome43 table.bigtod td { font-size: 200pt; }
 div.chromeTV table.bigtod td { font-size: 200pt; }
 table.bigtod { position: relative; top: 100px; }
-.timing-only, .race-only { display: none; }
-tr.timing-only { display: none; }
-tr.divider { height: 5px;fill: lightskyblue; background-color: lightskyblue; column-span: all;}
+tr.timing-only { display:table-row; visibility: visible;}
+tr.divider { height: 5px; fill: lightskyblue; background-color: lightskyblue; column-span: all;}
 span.stopped-indicator {
   display: none;
   font-size: 24pt; 
@@ -130,15 +129,20 @@ div.status   { font-size: 24pt; font-weight: normal; text-align: center; }
 span#message { color: #0000ff; display: none; }
 span#error   { color: #ff0000; }
 
-[data-mode="timing"][data-session="race"] span.timing-only.race-only { display: inline;}
-[data-mode="timing"][data-session="race"][data-closefinish="before"]:not([data-status="stopped"]):not([data-flag="Checkered"]) div.close-fin-before { 
+[data-closefinish="before"][data-status="running"]:not([data-flag="Checkered"]) div.close-fin-before { 
   display: block;
 }
-[data-mode="timing"][data-session="race"][data-closefinish="after"]:not([data-status="stopped"]):not([data-flag="Checkered"]) div.close-fin-after { 
+[data-closefinish="after"][data-status="running"]:not([data-flag="Checkered"]) div.close-fin-after { 
   display: block;
 }
+[data-session]:not([data-session="race"]) .race-only { display: none; }
+[data-mode]:not([data-mode="timing"]) .timing-only { display: none; }
+[data-show-proj-laps]:not([data-show-proj-laps="true"]) .proj-rem-laps { display: none; }
+[data-show-schd-laps]:not([data-show-schd-laps="true"]) .schd-laps { display: none; }
+
 [data-session="qual"] .progress {visibility: hidden;}
-[data-mode="timing"] tr.timing-only { display:table-row; visibility: visible;}
+[data-mode="timing"] 
 [data-status="stopped"] .stopped-indicator { display: block; }
 [data-nologo="false"] .branding-logo { visibility: visible; }
 [data-showversion="true"] .version { visibility: visible; }
+
