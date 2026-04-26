@@ -12,11 +12,15 @@ var f_date     = document.getElementById("date");
 var f_flag     = document.getElementById("flag");
 var f_flagtext = document.getElementById("flagtext");
 var f_laps     = document.getElementById("laps");
+var f_estLaps2Go = document.getElementById("est_laps2go");
 var f_laps2go  = document.getElementById("laps2go");
 var f_projLaps = document.getElementById("proj_total_laps");
 var f_totlaps = document.getElementById("sched_total_laps");
 var f_elapsed  = document.getElementById("elapsed");
+var f_proj_total = document.getElementById("proj_total_tm");
+var f_proj_above = document.getElementById("projected_above");
 var f_timeleft = document.getElementById("timeleft");
+var f_proj_below = document.getElementById("projected_below");
 var f_sched_total = document.getElementById("sched_total");
 var f_leaders  = document.getElementById("leaders");
 var f_clslead  = document.getElementById("clslead");
@@ -181,7 +185,7 @@ function show_local_time () {
 
 function parse_time (t) {
   found = t.match(/^(\d+):(\d+):(\d+)(?:\.(\d+))?$/)
-  if (found === undefined) {
+  if (found === null || found === undefined) {
     return undefined;
   }
   t = (found[1] * 3600) + (found[2] * 60) + (found[3] * 1);
@@ -230,29 +234,19 @@ function updateProgress(elapsed) {
 }
 
 function updateLaps2Go() {
+  if (estimated_laps2go !== undefined && estimated_laps2go < planned_laps2go) {
+    f_estLaps2Go.textContent = estimated_laps2go;
+  }
   if (planned_laps2go == 9999 || planned_laps2go === undefined) {
     f_laps2go.textContent = '';
-    f_laps2go.style.color = '';
-    return;
+  } else {
+    f_laps2go.textContent = planned_laps2go;
   }
-
-  // ONLY show estimated vs scheduled when in timing mode
-  if (display_mode === 'timing' && estimated_laps2go !== undefined && estimated_laps2go < planned_laps2go) {
-    f_laps2go.textContent = estimated_laps2go + '/' + planned_laps2go;
-    f_laps2go.style.color = 'orange';
-    return;
-  }
-
-  // Standard display for raceinfo mode
-  f_laps2go.textContent = planned_laps2go;
-  f_laps2go.style.color = '';
+  f_topdiv.dataset.showProjLaps = (estimated_laps2go !== undefined && (estimated_laps2go < planned_laps2go || planned_laps2go === undefined)) ? "true" : "false";
 }
 
 function updateProjectedTime() {
-  var f_proj_above = document.getElementById("projected_above");
-  var f_proj_below = document.getElementById("projected_below");
-  var f_proj_total = document.getElementById("proj_total");
-
+  
   if (!f_proj_above || !f_proj_below || cached_scheduled_total === undefined) return;
 
   // Exit if data is missing or not in timing mode
@@ -334,7 +328,7 @@ function computePassing(passing) {
   var lapsLeft = updateProjectedTime();
 
   // AUDIO ALERT TRIGGER: Only runs when this function is called (on passing)
-  // If lapsLeft is 2, the leader just crossed and has 2 projected laps left.
+  // If lapsLeft is 2, the leader just crossed and has 2 laps left (Current + Final).
   if (lapsLeft === 2 && !white_flag_warned) {
     white_flag_warned = true;
     if (f_wfAlert && f_wfAlert.checked) {
@@ -365,15 +359,14 @@ function heartbeat(e,s) {
   if (hb_timeout !== undefined) {
     window.clearTimeout(hb_timeout);
   }
-  hb_timeout = window.setTimeout(reconnect, 3000, s);
+  hb_timeout = window.setTimeout(reconnect, 20000, s);
 }
 
 function doconnect() {
     try {
         var host = "ws://" + window.location.hostname + ":" + data_port + "/";
-        if (window.location.protocol === "https:") {
-            // Useful with using a reverse proxy host that handles all of the SSL offloading and can redirect to the propery port over ws: on the internal lan  
-            var host = "wss://" + window.location.hostname + "/bigclock-ws/";
+    	  if (window.location.protocol === "https:") {
+          var host = "wss://" + window.location.hostname + "/bigclock-ws/";
         } 
         console.log("Host:", host);
         try {
@@ -422,9 +415,8 @@ function doconnect() {
              *   $H,pos,regno,bestlap,besttime
              *   $I,tod,date (init/reset)
              *   $J,regno,laptime,time
-             *   $SP,pos,regno,sectorIdx,sectorTm,elapsedMs
-             *   $SR,pos,regno,sectorIdx,recordTm,elapsedMs
-             *
+             *   $SP,pos,car,bestlap,besttime,besttimems
+             *   $SR,pos,car,laps,laptime,laptimems
              *   :V,server-version
              */
             if (fields[0] == '$A') {
@@ -499,7 +491,7 @@ function doconnect() {
                     if (totLaps > 9999) totLaps = 9999;
                     if (f_totlaps) {
                       f_totlaps.textContent = totLaps.toString();
-                      f_totlaps.style.visibility = totLaps == 9999 ? 'hidden' : 'visible';
+                      f_topdiv.dataset.showSchdLaps = totLaps != 9999
                     }
                 }
               }
@@ -630,11 +622,17 @@ function doconnect() {
               f_run      .textContent = '';
               setFlag('');
               f_laps     .textContent = '';
+              f_estLaps2Go.textContent = '';
               f_laps2go  .textContent = '';
-              f_laps2go  .style.color = '';
+              f_proj_total.textContent = '--:--:--.---';
+              f_proj_above.textContent = '';
+              f_proj_below.textContent = '';
+              f_sched_total.textContent = '--:--:--';
               planned_laps2go = undefined;
               estimated_laps2go = undefined;
               f_elapsed  .textContent = '--:--:--';
+              f_projLaps.textContent = '';
+              f_topdiv.dataset.showProjLaps = "false";
               f_timeleft .textContent = '--:--:--';
               f_leaders  .textContent = '';
               f_clslead  .textContent = '';
